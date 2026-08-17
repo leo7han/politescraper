@@ -13,7 +13,6 @@ OUTPUT_DIR = "output"
 os.makedirs(CACHE_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Define the precise schema using Pydantic
 class BookRecord(BaseModel):
     title: str
     product_url: str
@@ -25,33 +24,61 @@ class BookRecord(BaseModel):
     source_page: str
     fetched_at: str
 
-def fetch_and_cache(url: str, filename: str) -> str:
-    """Fetches a page politely or loads it from the local cache."""
+# Global dictionary to track run health
+stats = {
+    "pages_fetched": 0,
+    "cache_hits": 0,
+    "valid_records": 0,
+    "invalid_records": 0,
+    "failed_pages": 0
+}
+
+def fetch_and_cache(url: str, filename: str) -> str | None:
+    """Fetches a page politely with retry logic, or loads it from cache."""
     cache_path = os.path.join(CACHE_DIR, filename)
     
     if os.path.exists(cache_path):
+        stats["cache_hits"] += 1
         with open(cache_path, "r", encoding="utf-8") as f:
             return f.read()
 
-    print(f"FETCH: Requesting {url}...")
     headers = {
         "User-Agent": "FlyRankInternship-A9/1.0 (+https://github.com/your-username/polite-scraper)"
     }
-    time.sleep(0.5)
     
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            html = response.text
-            with open(cache_path, "w", encoding="utf-8") as f:
-                f.write(html)
-            return html
-        else:
-            print(f"FETCH FAILED: Status code {response.status_code}")
-            return ""
-    except requests.exceptions.RequestException as e:
-        print(f"FETCH ERROR: {e}")
-        return ""
+    for attempt in range(2): # Try once, retry once
+        time.sleep(0.5)
+        stats["pages_fetched"] += 1
+        print(f"FETCH: Requesting {url} (Attempt {attempt+1})...")
+        
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                html = response.text
+                with open(cache_path, "w", encoding="utf-8") as f:
+                    f.write(html)
+                return html
+            elif response.status_code in [403, 404]:
+                print(f"FETCH SKIPPED: {response.status_code} (Will not retry)")
+                stats["failed_pages"] += 1
+                return None
+            elif response.status_code >= 500:
+                print(f"FETCH ERROR: Server error {response.status_code}")
+                if attempt == 0:
+                    continue
+                stats["failed_pages"] += 1
+                return None
+            else:
+                stats["failed_pages"] += 1
+                return None
+        except requests.exceptions.RequestException as e:
+            print(f"FETCH ERROR: Network issue - {e}")
+            if attempt == 0:
+                continue
+            stats["failed_pages"] += 1
+            return None
+            
+    return None
 
 def discover_catalogue_pages():
     """Discovers books across the first 3 catalogue pages."""
@@ -62,7 +89,6 @@ def discover_catalogue_pages():
     while current_url and catalogue_pages < 3:
         catalogue_pages += 1
         filename = f"catalogue-page-{catalogue_pages}.html"
-        
         html = fetch_and_cache(current_url, filename)
         if not html:
             break
@@ -81,11 +107,9 @@ def discover_catalogue_pages():
         else:
             current_url = None
 
-    unique_urls = list(set(all_book_urls))
-    return unique_urls
+    return list(set(all_book_urls))
 
 def normalize_price(price_str: str) -> float:
-    """Converts a string like '£51.77' into a clean float 51.77"""
     if not price_str:
         return 0.0
     clean_str = ''.join(c for c in price_str if c.isdigit() or c == '.')
@@ -96,7 +120,6 @@ def normalize_price(price_str: str) -> float:
 
 def extract_and_validate_books(book_urls):
     """Extracts, normalizes, and validates records before storing them."""
-    # Using a dictionary keyed by canonical URL ensures idempotency (no duplicates)
     valid_records = {} 
     errors = []
     
@@ -113,13 +136,10 @@ def extract_and_validate_books(book_urls):
             continue
             
         title = product_main.find("h1").text if product_main.find("h1") else None
-        
         price_p = product_main.find("p", class_="price_color")
         price_text = price_p.text if price_p else ""
-        
         availability_p = product_main.find("p", class_="instock availability")
         availability_text = availability_p.text.strip() if availability_p else ""
-        
         rating_p = product_main.find("p", class_="star-rating")
         rating_text = rating_p["class"][1] if rating_p and len(rating_p["class"]) > 1 else None
         
@@ -130,7 +150,6 @@ def extract_and_validate_books(book_urls):
             if desc_p:
                 description = desc_p.text
                 
-        # 1. Normalize
         raw_record = {
             "title": title,
             "product_url": url,
@@ -143,28 +162,48 @@ def extract_and_validate_books(book_urls):
             "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         }
         
-        # 2. Validate
         try:
             validated = BookRecord(**raw_record)
             valid_records[url] = validated.model_dump()
+            stats["valid_records"] += 1
         except ValidationError as e:
             errors.append({"url": url, "error": str(e), "raw_record": raw_record})
+            stats["invalid_records"] += 1
             
-    # 3. Store
-    books_file = os.path.join(OUTPUT_DIR, "books.json")
-    with open(books_file, "w", encoding="utf-8") as f:
+    # Store records
+    with open(os.path.join(OUTPUT_DIR, "books.json"), "w", encoding="utf-8") as f:
         json.dump(list(valid_records.values()), f, indent=2)
         
     if errors:
         with open("errors.json", "w", encoding="utf-8") as f:
             json.dump(errors, f, indent=2)
-            
-    print(f"Validation complete.")
-    print(f"Good records safely stored in output/books.json: {len(valid_records)}")
-    if errors:
-        print(f"Failed records routed to errors.json: {len(errors)}")
 
 if __name__ == "__main__":
     print("Scraper initialized.")
+    start_time = datetime.now()
+    
     book_links = discover_catalogue_pages()
+    
+    # Deliberately inject one broken URL to prove failure survival (Stage 5 Checkpoint)
+    book_links.append("https://books.toscrape.com/catalogue/made-up-book-url_999/index.html")
+    
     extract_and_validate_books(book_links)
+    
+    duration = (datetime.now() - start_time).total_seconds()
+    
+    # Generate the Run Report
+    run_report = {
+        "start_time": start_time.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "duration_seconds": round(duration, 2),
+        "pages_fetched": stats["pages_fetched"],
+        "cache_hits": stats["cache_hits"],
+        "valid_records": stats["valid_records"],
+        "invalid_records": stats["invalid_records"],
+        "failed_pages": stats["failed_pages"]
+    }
+    
+    with open(os.path.join(OUTPUT_DIR, "run-report.json"), "w", encoding="utf-8") as f:
+        json.dump(run_report, f, indent=2)
+        
+    print("\n--- Run Complete ---")
+    print(json.dumps(run_report, indent=2))
