@@ -5,10 +5,25 @@ import json
 from datetime import datetime, timezone
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
+from pydantic import BaseModel, ValidationError
 
-# Set up the cache directory
+# Set up the cache and output directories
 CACHE_DIR = "cache"
+OUTPUT_DIR = "output"
 os.makedirs(CACHE_DIR, exist_ok=True)
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Define the precise schema using Pydantic
+class BookRecord(BaseModel):
+    title: str
+    product_url: str
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str | None
+    description: str | None
+    source_page: str
+    fetched_at: str
 
 def fetch_and_cache(url: str, filename: str) -> str:
     """Fetches a page politely or loads it from the local cache."""
@@ -22,7 +37,6 @@ def fetch_and_cache(url: str, filename: str) -> str:
     headers = {
         "User-Agent": "FlyRankInternship-A9/1.0 (+https://github.com/your-username/polite-scraper)"
     }
-    
     time.sleep(0.5)
     
     try:
@@ -54,7 +68,6 @@ def discover_catalogue_pages():
             break
             
         soup = BeautifulSoup(html, "html.parser")
-        
         for h3 in soup.find_all("h3"):
             a_tag = h3.find("a")
             if a_tag and "href" in a_tag.attrs:
@@ -69,18 +82,25 @@ def discover_catalogue_pages():
             current_url = None
 
     unique_urls = list(set(all_book_urls))
-    print(f"catalogue_pages={catalogue_pages}")
-    print(f"discovered={len(all_book_urls)}")
-    print(f"unique_urls={len(unique_urls)}")
-    
     return unique_urls
 
-def extract_book_details(book_urls):
-    """Extracts raw data fields from each individual book page."""
-    raw_records = []
+def normalize_price(price_str: str) -> float:
+    """Converts a string like '£51.77' into a clean float 51.77"""
+    if not price_str:
+        return 0.0
+    clean_str = ''.join(c for c in price_str if c.isdigit() or c == '.')
+    try:
+        return float(clean_str)
+    except ValueError:
+        return 0.0
+
+def extract_and_validate_books(book_urls):
+    """Extracts, normalizes, and validates records before storing them."""
+    # Using a dictionary keyed by canonical URL ensures idempotency (no duplicates)
+    valid_records = {} 
+    errors = []
     
     for url in book_urls:
-        # Create a clean filename based on the book's specific URL segment
         safe_name = url.split("/")[-2] + ".html"
         html = fetch_and_cache(url, f"book-{safe_name}")
         
@@ -89,18 +109,16 @@ def extract_book_details(book_urls):
             
         soup = BeautifulSoup(html, "html.parser")
         product_main = soup.find("div", class_="product_main")
-        
         if not product_main:
             continue
             
-        # Extract targeted elements
         title = product_main.find("h1").text if product_main.find("h1") else None
         
         price_p = product_main.find("p", class_="price_color")
-        price_text = price_p.text if price_p else None
+        price_text = price_p.text if price_p else ""
         
         availability_p = product_main.find("p", class_="instock availability")
-        availability_text = availability_p.text.strip() if availability_p else None
+        availability_text = availability_p.text.strip() if availability_p else ""
         
         rating_p = product_main.find("p", class_="star-rating")
         rating_text = rating_p["class"][1] if rating_p and len(rating_p["class"]) > 1 else None
@@ -112,27 +130,41 @@ def extract_book_details(book_urls):
             if desc_p:
                 description = desc_p.text
                 
-        # Construct the raw record
-        record = {
+        # 1. Normalize
+        raw_record = {
             "title": title,
             "product_url": url,
             "price_text": price_text,
+            "price_gbp": normalize_price(price_text),
             "availability_text": availability_text,
             "rating_text": rating_text,
             "description": description,
             "source_page": "https://books.toscrape.com/catalogue/page-1.html",
             "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         }
-        raw_records.append(record)
         
-    print(f"detail_pages={len(raw_records)}")
-    if raw_records:
-        print("\nSample Record:")
-        print(json.dumps(raw_records[0], indent=2))
+        # 2. Validate
+        try:
+            validated = BookRecord(**raw_record)
+            valid_records[url] = validated.model_dump()
+        except ValidationError as e:
+            errors.append({"url": url, "error": str(e), "raw_record": raw_record})
+            
+    # 3. Store
+    books_file = os.path.join(OUTPUT_DIR, "books.json")
+    with open(books_file, "w", encoding="utf-8") as f:
+        json.dump(list(valid_records.values()), f, indent=2)
         
-    return raw_records
+    if errors:
+        with open("errors.json", "w", encoding="utf-8") as f:
+            json.dump(errors, f, indent=2)
+            
+    print(f"Validation complete.")
+    print(f"Good records safely stored in output/books.json: {len(valid_records)}")
+    if errors:
+        print(f"Failed records routed to errors.json: {len(errors)}")
 
 if __name__ == "__main__":
     print("Scraper initialized.")
     book_links = discover_catalogue_pages()
-    records = extract_book_details(book_links)
+    extract_and_validate_books(book_links)
